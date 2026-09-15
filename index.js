@@ -1,66 +1,102 @@
 import express from 'express';
-import { Readable } from 'stream';
 
 const app = express();
-// Render環境ではPORT環境変数が自動的に割り当てられます
+app.disable('x-powered-by');
+
 const PORT = process.env.PORT || 10000;
+const WORKER_URL = (process.env.WORKER_URL || 'https://mangaraw.shunichi-0314.workers.dev').replace(/\/$/, '');
 
-// 【重要】ここにデプロイ済みの Cloudflare Worker のURLを貼り付けてください
-// 例: 'https://manga-proxy.your-subdomain.workers.dev'
-const WORKER_URL = process.env.WORKER_URL || 'https://your-worker-name.your-subdomain.workers.dev';
+const TTL = 10 * 60 * 1000;        // 10分間は「新鮮」とみなす
+const MIN_INTERVAL = 30 * 1000;    // 上流への再アクセスは最低30秒間隔
+const cache = new Map();           // key -> { t, lastUp, status, type, buf, blocked }
+const inflight = new Map();        // シングルフライト用
 
-app.all('*', async (req, res) => {
+function isBlock(status, type, buf) {
+  if (status === 403 || status === 429 || status === 503) return true;
+  if ((type || '').includes('text/html')) {
+    const s = buf.toString('utf8');
+    return /sorry, you have been blocked/i.test(s) ||
+           /attention required/i.test(s) ||
+           /cloudflare ray id/i.test(s);
+  }
+  return false;
+}
+
+async function fetchFromWorker(key) {
+  const res = await fetch(WORKER_URL + key, {
+    headers: {
+      'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8',
+      'Accept-Language': 'ja,en-US;q=0.9,en;q=0.8',
+      'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36'
+    }
+  });
+  const type = res.headers.get('content-type') || 'application/octet-stream';
+  const buf = Buffer.from(await res.arrayBuffer());
+  return { status: res.status, type, buf };
+}
+
+async function load(key) {
+  const now = Date.now();
+  const hit = cache.get(key);
+
+  // 新鮮なキャッシュがあれば即返す
+  if (hit && !hit.blocked && now - hit.t < TTL) return hit;
+  // 直近で上流アクセス済みなら、たとえ古くてもそれを返す（レート制限対策）
+  if (hit && now - hit.lastUp < MIN_INTERVAL) return hit;
+
+  // 同時リクエストは1本のfetchにまとめる
+  if (inflight.has(key)) return inflight.get(key);
+
+  const p = (async () => {
+    try {
+      const r = await fetchFromWorker(key);
+      const entry = { ...r, t: now, lastUp: now, blocked: isBlock(r.status, r.type, r.buf) };
+      if (!entry.blocked) {
+        cache.set(key, entry);
+        return entry;
+      }
+      // ブロックされたら「最後の成功ページ」を返す（stale配信）
+      if (hit && !hit.blocked) return hit;
+      cache.set(key, entry);
+      return entry;
+    } catch (e) {
+      if (hit && !hit.blocked) return hit;  // ネットワークエラーもstaleで吸収
+      throw e;
+    } finally {
+      inflight.delete(key);
+    }
+  })();
+
+  inflight.set(key, p);
+  return p;
+}
+
+// Render のヘルスチェックはここでローカル応答（上流へ流さない）
+app.get('/healthz', (req, res) => res.send('OK'));
+
+app.get('*', async (req, res) => {
+  const key = req.url || '/';
   try {
-    // クライアントからのリクエストパスを Worker の URL に結合
-    // 例: req.url が "/page/2/" なら WORKER_URL + "/page/2/" になる
-    const targetUrl = new URL(req.url, WORKER_URL).toString();
+    const entry = await load(key);
 
-    // リクエストヘッダーの準備 (host などは fetch が自動設定するため削除)
-    const headers = { ...req.headers };
-    delete headers.host;
-    delete headers.connection;
-    delete headers['content-length'];
-
-    const fetchOptions = {
-      method: req.method,
-      headers: headers,
-    };
-
-    // GET/HEAD 以外のリクエスト（POSTなど）の場合のボディ処理
-    // ※漫画サイトの閲覧は基本的に GET リクエストのみなので、簡易的な実装にしています
-    if (req.method !== 'GET' && req.method !== 'HEAD') {
-      let body = '';
-      req.on('data', chunk => { body += chunk.toString(); });
-      await new Promise(resolve => req.on('end', resolve));
-      fetchOptions.body = body;
+    if (entry.blocked) {
+      // 成功キャッシュが全く無い場合のフォールバックページ（60秒後に自動再試行）
+      return res.status(503).set('Content-Type', 'text/html; charset=utf-8').send(`
+        <!DOCTYPE html><html lang="ja"><head><meta charset="utf-8">
+        <meta http-equiv="refresh" content="60">
+        <title>Loading...</title></head>
+        <body style="font-family:sans-serif;background:#111;color:#eee;text-align:center;padding-top:20vh;">
+          <h2>対象サイトが一時的にブロック中です</h2>
+          <p>60秒後に自動で再試行します...</p>
+        </body></html>`);
     }
 
-    // Cloudflare Worker へリクエストを転送
-    const response = await fetch(targetUrl, fetchOptions);
-
-    // Worker からのレスポンスヘッダーをクライアントに返す
-    response.headers.forEach((value, key) => {
-      // gzip 等のエンコーディングは Render/Express 側で処理させるため削除して衝突を防ぐ
-      if (key.toLowerCase() !== 'content-encoding' && key.toLowerCase() !== 'transfer-encoding') {
-        res.setHeader(key, value);
-      }
-    });
-
-    // ステータスコードを設定
-    res.status(response.status);
-
-    // Node.js 18+ の Web Stream (response.body) を Node Stream に変換してパイプ転送
-    // これにより、大容量の画像やHTMLでもメモリを圧迫せずにストリーム配信が可能
-    const nodeStream = Readable.fromWeb(response.body);
-    nodeStream.pipe(res);
-
-  } catch (error) {
-    console.error('Proxy Error:', error);
-    res.status(500).send('Internal Server Error on Render Proxy');
+    res.set('Content-Type', entry.type);
+    res.set('Cache-Control', 'public, max-age=60');
+    res.status(entry.status).send(entry.buf);
+  } catch (e) {
+    res.status(502).send('Upstream fetch failed: ' + e.message);
   }
 });
 
-app.listen(PORT, () => {
-  console.log(`Render proxy server is running on port ${PORT}`);
-  console.log(`Targeting Worker at: ${WORKER_URL}`);
-});
+app.listen(PORT, () => console.log(`Render proxy ready on ${PORT}`));
