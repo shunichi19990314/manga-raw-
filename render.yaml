@@ -1,0 +1,11 @@
+services:
+  - type: web
+    name: manga-raw
+    runtime: node
+    plan: free
+    healthCheckPath: /healthz
+    buildCommand: npm install
+    startCommand: npm start
+    envVars:
+      - key: WORKER_URL
+        value: https://mangaraw.shunichi-0314.workers.dev
